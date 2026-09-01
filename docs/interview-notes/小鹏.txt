@@ -1,0 +1,198 @@
+# 小鹏汽车：AI Infra（2026-08-04）
+
+## 面试概况
+
+- 岗位：AI Infra
+- 本轮问题：Transformer 基本架构、千问最新模型架构、多模态图片输入流程、模型量化
+- 整体考察方向：不仅要知道模型算法，还要能把模型结构与训练、推理、显存、吞吐和部署联系起来。
+
+## 1. Transformer 的基本架构是什么？
+
+**推荐口述回答：**
+
+Transformer 的核心是注意力机制。原始 Transformer 是 Encoder-Decoder 架构：Encoder 负责理解输入，Decoder 通过 Masked Self-Attention 和对 Encoder 输出的 Cross-Attention 自回归地产生结果。现在 GPT、Qwen 等大语言模型通常只保留 Decoder，采用 Decoder-only 的 Causal Transformer。
+
+输入文本首先经过 Tokenizer 变成 token id，再映射成词向量，并加入位置信息。随后数据依次通过多个 Transformer Block。每个 Block 的核心包含两部分：第一部分是多头自注意力，第二部分是前馈网络；两部分外面都有残差连接和归一化。现代大模型中常见的是 Pre-Norm、RMSNorm、RoPE 和 SwiGLU。
+
+自注意力会把输入分别线性映射为 Query、Key 和 Value，然后计算：
+
+```text
+Attention(Q, K, V) = softmax(QKᵀ / √d + Mask)V
+```
+
+其中因果 Mask 保证当前位置只能看到自己和之前的 token，不能看到未来 token。多头注意力让不同的头学习不同类型的依赖关系。FFN 则对每个 token 独立进行非线性特征变换。经过多层堆叠后，最后通过线性层和 Softmax 得到下一个 token 的概率，模型不断重复这一过程完成自回归生成。
+
+推理时会缓存历史 token 的 Key 和 Value，也就是 KV Cache，避免每生成一个新 token 都重新计算整段历史。KV Cache 能减少计算，但会占用大量显存，因此 GQA、MQA、PagedAttention 和 KV Cache 量化都是 AI Infra 中的重要优化。
+
+**需要区分的三种结构：**
+
+| 结构 | 典型模型 | 特点 |
+| --- | --- | --- |
+| Encoder-only | BERT | 双向注意力，擅长理解、分类和向量表示 |
+| Encoder-Decoder | 原始 Transformer、T5 | Encoder 理解输入，Decoder 通过 Cross-Attention 生成输出 |
+| Decoder-only | GPT、Llama、Qwen | 因果注意力，自回归预测下一个 token，是当前 LLM 的主流结构 |
+
+**AI Infra 角度可以补充：**
+
+- Prefill 阶段一次处理整段 Prompt，计算量较大，矩阵乘法并行度高，通常更偏计算受限。
+- Decode 阶段每次只生成一个或少量 token，需要反复读取模型权重和 KV Cache，通常更偏显存带宽受限。
+- 普通全注意力对序列长度的计算复杂度约为 `O(n²)`；长上下文会同时放大注意力计算和 KV Cache 压力。
+- GQA/MQA 减少 KV 头数量，FlashAttention 减少中间结果的显存读写，连续批处理和 PagedAttention 提升服务吞吐与显存利用率。
+
+**一句话总结：**Transformer 用注意力建模 token 之间的关系，用 FFN 做逐 token 的特征变换；现代大模型通常采用带因果 Mask 的 Decoder-only 架构，自回归地预测下一个 token。
+
+## 2. 你了解千问最新的大模型架构吗？
+
+> 版本说明：以下内容按 2026-08-04 的公开资料整理。当前最新公开权重系列为 Qwen3.6，主要开源版本包括 Qwen3.6-27B Dense 和 Qwen3.6-35B-A3B MoE。
+
+**推荐口述回答：**
+
+我了解目前公开的 Qwen3.6。它已经不是每层都使用标准全注意力的传统 Decoder-only Transformer，而是一个原生多模态的混合注意力因果语言模型，外接视觉编码器。语言主干以 3:1 的比例交替堆叠 Gated DeltaNet 线性注意力和 Gated Full Attention，也就是每三个线性注意力层后放一个全注意力层。
+
+这样设计的出发点是：线性注意力降低长上下文的计算和缓存压力，全注意力保留精确的全局 token 交互和检索能力。全注意力部分还采用 GQA，用较少的 KV 头降低 KV Cache。模型原生支持 262,144 token 上下文，并可以扩展到约 101 万 token；同时训练了 Multi-Token Prediction，可以配合投机解码一次验证多个候选 token，提高生成吞吐。
+
+Qwen3.6-27B 是 Dense 模型，共 64 层，每个 token 都经过全部 FFN 参数。Qwen3.6-35B-A3B 是 MoE 模型，共 40 层，总参数约 35B，但每个 token 只激活约 3B 参数；它有 256 个路由专家，每次激活 8 个路由专家，并始终使用 1 个共享专家。因此 MoE 可以在不让单 token 计算量等比例增长的情况下扩大模型容量，但部署时仍要存放全部专家权重，还要处理路由、专家并行、负载均衡和跨卡通信。
+
+在多模态部分，Qwen3.6 是带 Vision Encoder 的 Causal Language Model。视觉塔沿用 Qwen3-VL 编码器，把图片或视频编码成视觉 token，再与文本 token 放进统一序列，由语言主干联合建模。其位置编码包含时间、高度和宽度等多维信息，方便模型理解图片空间和视频时序。
+
+**两个公开版本的关键差异：**
+
+| 项目 | Qwen3.6-27B | Qwen3.6-35B-A3B |
+| --- | --- | --- |
+| 参数形态 | 27B Dense | 35B 总参数、约 3B 激活的 MoE |
+| 层数 | 64 | 40 |
+| 层布局 | 16 ×（3 个 Gated DeltaNet + 1 个 Gated Attention） | 10 ×（3 个 Gated DeltaNet + 1 个 Gated Attention） |
+| FFN | 每层普通 Dense FFN | 256 个路由专家，激活 8 个，另有 1 个共享专家 |
+| 全注意力 Q/KV 头 | 24 / 4 | 16 / 2 |
+| 上下文 | 原生 262K，可扩展到约 1.01M | 原生 262K，可扩展到约 1.01M |
+| 部署特点 | 计算和通信路径更规整 | 单 token 激活量小，但专家权重、路由和跨卡通信更复杂 |
+
+**各项设计与 Infra 的关系：**
+
+- **Gated DeltaNet：**线性注意力用固定大小的状态递推，长序列的复杂度和缓存增长更友好；但需要专门优化的 kernel，否则理论优势未必能转化为实际吞吐。
+- **3:1 混合注意力：**大部分层走高效线性注意力，少部分层保留全注意力，兼顾效率与全局信息交互。
+- **GQA：**多个 Q 头共享较少的 K/V 头，明显降低全注意力层的 KV Cache。
+- **MoE：**增加总参数容量而不等比例增加单 token FLOPs，但会带来 Expert Parallel、All-to-All 通信、热点专家和负载不均衡问题。
+- **MTP：**训练模型预测后续多个 token，部署时可用于 speculative decoding，减少串行 Decode 次数。
+- **原生多模态：**视觉 token 会增加序列长度，因此动态分辨率、视觉 token 压缩、混合注意力以及多模态 Prefill 优化都很重要。
+
+**容易答错的地方：**
+
+- “Thinking”主要是后训练和生成行为，不应简单说成一种全新的网络骨架。
+- MoE 的 “A3B”表示单 token 激活参数量约 3B，不代表部署时只需要保存 3B 权重。
+- 线性注意力并不意味着模型完全没有 KV Cache 或中间状态，而是缓存形式和随序列增长的方式与标准全注意力不同。
+
+**一句话总结：**Qwen3.6 是原生多模态的混合注意力 Causal LM，用 3:1 的 Gated DeltaNet 与全注意力兼顾长上下文效率和全局建模，并通过 GQA、MoE 和 MTP 分别优化 KV Cache、参数容量和解码吞吐。
+
+## 3. 图片这样的多维输入给大模型后，模型是如何读到、思考并回答的？
+
+**推荐口述回答：**
+
+大模型不能直接读取 JPEG 像素，也不能把二维矩阵原样交给文本 Transformer。典型视觉语言模型会先用视觉编码器把图片转成一串与文本 embedding 维度兼容的视觉 token，再把视觉 token 和问题的文本 token 放进同一个序列，由语言模型联合建模并自回归生成答案。
+
+可以把流程分成六步：
+
+1. **预处理：**图片先解码为像素张量，进行缩放、归一化，并按固定或动态分辨率切分。动态分辨率会根据原图尺寸决定视觉 token 数量，细节更多，但 Prefill 成本也更高。
+2. **Patch 化：**把图片切成小块，每个 Patch 经过线性映射变成一个向量。它类似文本分词，只是文本 token 来自词表，视觉 token 来自像素块。
+3. **视觉编码：**将 Patch token 输入 ViT 等 Vision Encoder，通过多层视觉注意力提取物体、文字、边缘、空间关系等高层特征。
+4. **对齐与压缩：**通过 Projector、MLP 或 Patch Merger 把视觉特征映射到语言模型的隐藏维度，并适当合并 token，控制序列长度。
+5. **多模态融合：**在特殊的图片起止 token 之间插入视觉 embedding，再与用户问题的文本 embedding 拼成统一序列。位置编码除了序列顺序，还可表达图片的高度、宽度；视频还会加入时间维度。语言模型的注意力因此可以让问题中的“左边”“车牌”“这个物体”等词关注到相应视觉 token。
+6. **生成答案：**融合后的隐藏状态经过语言模型逐层计算，输出下一个文本 token 的概率，再使用贪心、Beam Search 或采样逐 token 生成答案。所谓“思考”，在实现层面仍是多层注意力和 FFN 对隐藏状态的连续变换；如果模型输出显式推理文本，那也是自回归生成的 token。
+
+```text
+图片 → 解码/缩放 → Patchify → Vision Encoder → Projector/Merger → 视觉 token ┐
+                                                                      ├→ 统一多模态序列 → LLM → 文本答案
+问题 → Tokenizer → 文本 token ─────────────────────────────────────────┘
+```
+
+Qwen3.6 属于原生多模态模型：训练阶段就使用交错的文本、图片和视频 token，而不是只在一个冻结的文本模型前临时接视觉模块。其视觉塔沿用 Qwen3-VL Encoder；Qwen3-VL 还通过 Interleaved-MRoPE 表示时间、高度和宽度，通过 DeepStack 融合 ViT 不同层级的特征，以保留细粒度信息。
+
+**模型为什么知道视觉 token 和文字含义的对应关系？**
+
+这不是由手写规则完成的，而是从训练数据中学到的。预训练会使用图文对、OCR、图表、文档、视频和交错多模态数据，让图片特征与文本语义对齐；之后再通过多模态指令微调、偏好优化或强化学习，让模型学会按问题作答、遵循格式并进行视觉推理。
+
+**AI Infra 角度可以补充：**
+
+- 图片分辨率越高，Patch 越多，视觉 token 越多，Vision Encoder 和 LLM Prefill 的延迟、显存都会上升。
+- 同一张图片被多轮提问时，可以考虑缓存视觉编码结果或 Prefix/KV Cache，避免重复编码。
+- 多模态批处理需要按不同分辨率和 token 长度做调度，否则 Padding 会浪费计算。
+- Vision Encoder 和 LLM 的计算形态不同，可以分别做量化、并行和 kernel 优化；还要关注首 token 延迟而不只是 Decode 吞吐。
+
+**一句话总结：**图片先由视觉编码器变成视觉 token，再和文字 token 对齐并拼进统一序列；语言模型通过注意力融合视觉与文本信息，最后仍以预测下一个文本 token 的方式生成答案。
+
+## 4. 你知道量化吗？
+
+**推荐口述回答：**
+
+量化是把模型中的高精度浮点数，例如 FP32、FP16 或 BF16，映射到 INT8、INT4、FP8 等低精度表示。主要目的不是简单压缩文件，而是降低权重和 KV Cache 的显存占用、减少显存带宽、提高吞吐，并降低部署成本；代价是可能产生精度损失，而且真实加速依赖硬件和推理框架是否有高效的低精度 kernel。
+
+最基本的均匀整数量化可以写成：
+
+```text
+q = clip(round(x / scale) + zero_point)
+x̂ = scale × (q - zero_point)
+```
+
+`scale`决定浮点区间和整数区间的映射比例，`zero_point`让实数 0 能映射到整数。对称量化通常令 `zero_point = 0`，实现简单、计算效率高；非对称量化能更好利用整数表示范围，但计算和存储略复杂。
+
+例如，一个 7B 模型仅计算权重的理论空间，FP16 约为 14 GB，INT8 约为 7 GB，INT4 约为 3.5 GB。实际部署还要加上量化参数、Embedding、临时张量、CUDA Context 和 KV Cache，因此总显存不会严格等于这个理论值。
+
+**常见分类：**
+
+### 1. 按训练阶段分类
+
+- **PTQ（训练后量化）：**模型训练完成后，使用少量校准数据甚至不使用校准数据完成量化。成本低、落地快，是大模型部署最常见的方式。
+- **QAT（量化感知训练）：**训练或微调时插入 Fake Quantization，让模型提前适应量化误差。通常精度更好，但训练成本更高。
+
+### 2. 按量化对象分类
+
+- **Weight-only：**例如 W8A16、W4A16，只量化权重，激活仍用 FP16/BF16。适合 Decode 阶段，因为 Decode 经常受读取权重的显存带宽限制。
+- **Weight + Activation：**例如 W8A8、FP8，需要同时处理激活值中的离群点，更有机会真正使用低精度 Tensor Core 加速矩阵乘法。
+- **KV Cache 量化：**把 KV Cache 压到 FP8、INT8 甚至更低位宽，长上下文和高并发时收益明显，但可能影响长文本检索与生成质量。
+
+### 3. 按量化粒度分类
+
+- **Per-tensor：**整个张量共用一个 scale，开销小，但容易被离群值拉大量化范围。
+- **Per-channel：**每个输出通道一个 scale，通常精度更好。
+- **Per-group：**每 32、64 或 128 个权重共享一个 scale，是 INT4 权重量化中常见的精度与开销折中。
+- 激活还可以采用 Per-token 动态量化，以适应不同 token 的数值分布。
+
+**常见大模型量化方法：**
+
+- **GPTQ：**典型的 PTQ Weight-only 方法，利用近似二阶信息逐块补偿量化误差，常用于 INT4 权重量化。
+- **AWQ：**观察激活分布，保护少量对输出非常重要的显著权重，再对其余权重进行低比特量化。
+- **SmoothQuant：**通过等价缩放把激活中的量化困难部分迁移到权重，便于实现 W8A8。
+- **QAT/低比特微调：**在训练中显式模拟低精度计算，适合对精度要求高且有训练资源的场景。
+
+**部署时不能只看模型大小，还要验证：**
+
+- 目标 GPU/NPU 是否原生支持该数据类型，推理框架是否有匹配的 GEMM、Attention 和 MoE kernel。
+- 反量化开销是否抵消了内存带宽收益；小 Batch、Prefill 和 Decode 的收益可能完全不同。
+- 校准数据是否覆盖真实业务分布，数学、代码、OCR、多模态和长上下文等敏感能力是否下降。
+- 首尾层、Embedding、LM Head、MoE Router 或含明显离群值的层是否需要保留更高精度。
+- 应同时比较准确率、困惑度、TTFT、TPOT、吞吐、峰值显存和单位请求成本。
+
+**如果面试官问“量化为什么会加速”：**
+
+第一，低位宽让同样显存能放下更大的模型或更多 KV Cache；第二，每次从显存读取的字节数减少，能缓解 Decode 阶段的带宽瓶颈；第三，如果硬件具有 INT8、INT4 或 FP8 Tensor Core 且框架提供融合 kernel，单次矩阵乘法的计算吞吐也会提升。但如果运行时每一步都要用低效 kernel 反量化回 FP16，可能只省显存而不一定加速。
+
+**一句话总结：**量化是在可接受的精度损失下，用低位宽表示权重、激活或 KV Cache；它能否带来真实收益，取决于量化算法、业务数据、硬件能力和推理 kernel 的共同配合。
+
+## 本轮复盘与后续准备
+
+这四道题从模型基础一路追到最新架构、多模态和部署优化，说明岗位关注的是“模型原理 + 系统实现”的结合。后续建议重点补齐以下内容：
+
+1. 能手写 Attention 公式，并解释 MHA、MQA、GQA、KV Cache 和 FlashAttention 的区别。
+2. 能从 Prefill/Decode、Compute-bound/Memory-bound 的角度分析 LLM 推理瓶颈。
+3. 能说明 Dense 与 MoE 的部署差异，包括 TP、PP、EP、All-to-All 和负载均衡。
+4. 能完整讲清一张图片如何变成视觉 token，以及动态分辨率对 TTFT 和显存的影响。
+5. 能比较 FP16、FP8、INT8、INT4，说明 PTQ、QAT、GPTQ、AWQ、SmoothQuant 的适用场景。
+6. 建议继续准备 vLLM/SGLang、PagedAttention、Continuous Batching、Speculative Decoding、CUDA Graph、Tensor Parallel 和 Prefix Cache。
+
+## 资料来源
+
+- [Qwen3.6 官方仓库](https://github.com/QwenLM/Qwen3.6)
+- [Qwen3.6-27B 官方 Model Card](https://huggingface.co/Qwen/Qwen3.6-27B)
+- [Qwen3.6-35B-A3B 官方 Model Card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
+- [Hugging Face Transformers：Qwen3.5/Qwen3.6 架构说明](https://huggingface.co/docs/transformers/model_doc/qwen3_5)
+- [Qwen3-VL 官方仓库与架构说明](https://github.com/QwenLM/Qwen3-VL)
